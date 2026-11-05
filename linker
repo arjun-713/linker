@@ -1,0 +1,1202 @@
+#!/usr/bin/env python3
+"""linker — store your links under short aliases and copy them from anywhere.
+
+    linker add github https://github.com/you --tags dev
+    linker cp github
+    linker ls --tag dev
+
+Links live in ~/.config/linker/links.json (override with $LINKER_STORE).
+Python 3 standard library only. Exit codes: 0 ok · 1 error · 2 no such alias · 3 clipboard failure.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import copy
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+VERSION = "1.0.0"
+IS_MACOS = sys.platform == "darwin"
+
+
+# --------------------------------------------------------------------------
+# theme — the only place that knows what any style code means
+# --------------------------------------------------------------------------
+class Palette:
+    """Semantic tokens: alias/url/ok/warn/err/meta. Render everything through these."""
+
+    RESET = "\x1b[0m"
+    TOKENS = {
+        "alias": "\x1b[1m",   # bold: the primary object (link alias)
+        "url": "\x1b[36m",    # accent (cyan): urls
+        "ok": "\x1b[32m",     # success
+        "warn": "\x1b[33m",   # warning
+        "err": "\x1b[31m",    # error
+        "meta": "\x1b[90m",   # muted secondary detail
+    }
+
+    def __init__(self):
+        self.enabled = self._detect()
+
+    @staticmethod
+    def _detect():
+        if os.environ.get("LINKER_FORCE_COLOR"):
+            return True
+        return (
+            sys.stdout.isatty()
+            and not os.environ.get("NO_COLOR")
+            and os.environ.get("TERM") != "dumb"
+        )
+
+    def off(self):
+        self.enabled = False
+
+    def paint(self, text, token):
+        if not text or not self.enabled:
+            return text
+        return self.TOKENS[token] + text + self.RESET
+
+    def alias(self, t):
+        return self.paint(t, "alias")
+
+    def url(self, t):
+        return self.paint(t, "url")
+
+    def ok(self, t):
+        return self.paint(t, "ok")
+
+    def warn(self, t):
+        return self.paint(t, "warn")
+
+    def err(self, t):
+        return self.paint(t, "err")
+
+    def meta(self, t):
+        return self.paint(t, "meta")
+
+
+palette = Palette()
+
+
+# --------------------------------------------------------------------------
+# output helpers
+# --------------------------------------------------------------------------
+def out(message=""):
+    print(message)
+
+
+def ok(message):
+    print(palette.ok("✓ ") + message)
+
+
+def warn_line(message):
+    print(palette.warn("! ") + message, file=sys.stderr)
+
+
+def meta(message):
+    print(palette.meta(message))
+
+
+def clear_len(text):
+    return len(re.sub("\x1b\\[[0-9;]*m", "", text))
+
+
+def trunc(text, width):
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text
+    return text[: max(0, width - 1)] + "…"
+
+
+def terminal_width(default=80):
+    if sys.stdout.isatty():
+        return shutil.get_terminal_size((default, 24)).columns
+    return None
+
+
+def styled_row(cells, sep="  "):
+    """cells: list of (raw_text, token_or_None, pad_width_or_None); pads only non-final cells."""
+    parts = []
+    for raw, token, width in cells:
+        text = raw.ljust(width) if width is not None else raw
+        parts.append(palette.paint(text, token) if token else text)
+    return sep.join(parts)
+
+
+# --------------------------------------------------------------------------
+# errors
+# --------------------------------------------------------------------------
+class LinkerError(Exception):
+    """User-facing error with hints and an exit code."""
+
+    def __init__(self, message, hints=(), code=1):
+        super().__init__(message)
+        self.hints = list(hints)
+        self.code = code
+
+
+class AliasError(LinkerError):
+    """Alias could not be resolved (exit code 2)."""
+
+    def __init__(self, message, hints=()):
+        super().__init__(message, hints=hints, code=2)
+
+
+def pluralize(n, word):
+    return f"{n} {word}" + ("" if n == 1 else "s")
+
+
+def render_error(err):
+    print(palette.err("error: ") + str(err), file=sys.stderr)
+    for hint in err.hints:
+        print(palette.meta(hint), file=sys.stderr)
+
+
+# --------------------------------------------------------------------------
+# fuzzy scoring
+# --------------------------------------------------------------------------
+def fuzzy_score(needle, haystack):
+    """Subsequence match score (higher better) or None when not a subsequence.
+
+    Case-insensitive. Rewards consecutive runs and matches at string/word starts.
+    """
+    if not needle:
+        return 0
+    n, h = needle.lower(), haystack.lower()
+    if len(n) > len(h):
+        return None
+    score = 0
+    prev = -1
+    for ch in n:
+        i = h.find(ch, prev + 1)
+        if i < 0:
+            return None
+        pts = 1
+        if prev >= 0 and i == prev + 1:
+            pts += 1
+        if i == 0 or h[i - 1] in "-_/.@ ":
+            pts += 3
+        score += pts
+        prev = i
+    if h.startswith(n):
+        score += 5
+    if len(n) == len(h):
+        score += 2
+    return score
+
+
+def suggest_aliases(store, query, limit=3):
+    """Did-you-mean candidates: subsequence fuzzy first, bounded edit-distance fallback."""
+    scored = []
+    for link in sorted(store.all(), key=lambda l: l.alias):
+        s = fuzzy_score(query, link.alias)
+        if s is not None:
+            scored.append((s, link.alias))
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    if scored:
+        return [alias for _, alias in scored[:limit]]
+    scored = []
+    for link in sorted(store.all(), key=lambda l: l.alias):
+        d = _levenshtein(query, link.alias)
+        if d is not None:
+            scored.append((d, link.alias))
+    scored.sort(key=lambda t: (t[0], t[1]))
+    return [alias for _, alias in scored[:limit]]
+
+
+def _levenshtein(a, b, cap=2):
+    """Bounded edit distance (None when > cap). Assuming already-lowercased input."""
+    la, lb = len(a), len(b)
+    if abs(la - lb) > cap:
+        return None
+    prev = list(range(lb + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cost = 0 if ca == cb else 1
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost))
+        if min(cur) > cap:
+            return None
+        prev = cur
+    dist = prev[lb]
+    return dist if dist <= cap else None
+
+
+# --------------------------------------------------------------------------
+# validation
+# --------------------------------------------------------------------------
+ALIAS_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://\S+$")
+GIT_SSH_RE = re.compile(r"^git@([\w.-]+):(.+?)(\.git)?$", re.IGNORECASE)
+
+
+def normalize_alias(raw):
+    alias = raw.strip().lower()
+    if not ALIAS_RE.match(alias):
+        raise LinkerError(
+            f'invalid alias "{raw}": letters, digits, "-" or "_" (≤32 chars, '
+            "start with letter or digit)",
+            hints=["Try: linker add github https://github.com/you"],
+        )
+    return alias
+
+
+def clean_url(raw):
+    url = raw.strip()
+    gitssh = GIT_SSH_RE.match(url)
+    if gitssh:
+        url = f"https://{gitssh.group(1)}/{gitssh.group(2)}"
+    if not SCHEME_RE.match(url):
+        stripped = url.strip()
+        if "." in stripped and ":" not in stripped:
+            hint = f"Try: include the scheme — e.g. https://{stripped}"
+        elif stripped.startswith("git@"):
+            hint = "Try: with the scheme — e.g. ssh://git@host/user/repo.git"
+        else:
+            hint = "Try: include a scheme — https://, ssh://, mailto:, …"
+        raise LinkerError(f'not a valid url: "{raw}"', hints=[hint])
+    return url
+
+
+def parse_tags(raw):
+    if raw is None:
+        return []
+    seen, tags = set(), []
+    for part in raw.split(","):
+        tag = part.strip().lower().strip()
+        if tag and tag not in seen:
+            seen.add(tag)
+            tags.append(tag)
+    return tags
+
+
+def parse_iso(ts):
+    try:
+        return datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return None
+
+
+def time_ago(ts):
+    """'just now' · '5m ago' · '3h ago' · '12d ago' · '2026-10-16' · 'never'."""
+    if not ts:
+        return "never"
+    dt = parse_iso(ts)
+    if not dt:
+        return ts
+    now = (
+        datetime.now(timezone.utc)
+        if dt.tzinfo
+        else datetime.now(timezone.utc).replace(tzinfo=None)
+    )
+    seconds = (now - dt).total_seconds()
+    if seconds < 90:
+        return "just now"
+    if seconds < 90 * 60:
+        return f"{int(seconds / 60)}m ago"
+    if seconds < 24 * 3600:
+        return f"{int(seconds / 3600)}h ago"
+    if seconds < 30 * 86400:
+        return f"{int(seconds / 86400)}d ago"
+    return dt.strftime("%Y-%m-%d")
+
+
+def date_of(ts):
+    dt = parse_iso(ts)
+    return dt.strftime("%Y-%m-%d") if dt else (ts or "—")
+
+
+# --------------------------------------------------------------------------
+# store
+# --------------------------------------------------------------------------
+@dataclass
+class Link:
+    alias: str
+    url: str
+    tags: list
+    note: str
+    created_at: str
+    updated_at: str
+    copy_count: int = 0
+    last_copied: str = ""
+
+    @classmethod
+    def new(cls, alias, url, tags=None, note=""):
+        stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        return cls(
+            alias=alias, url=url, tags=tags or [], note=note,
+            created_at=stamp, updated_at=stamp,
+        )
+
+    def touch_copy(self):
+        stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        self.copy_count += 1
+        self.last_copied = stamp
+        self.updated_at = stamp
+
+    def to_dict(self):
+        d = {
+            "alias": self.alias,
+            "url": self.url,
+            "tags": self.tags,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "copy_count": self.copy_count,
+            "last_copied": self.last_copied,
+        }
+        if self.note:
+            d["note"] = self.note
+        return d
+
+    @classmethod
+    def from_dict(cls, d, alias=None):
+        return cls(
+            alias=alias if alias is not None else str(d.get("alias", "")),
+            url=str(d.get("url", "")),
+            tags=[str(t) for t in (d.get("tags") or [])],
+            note=str(d.get("note") or ""),
+            created_at=str(d.get("created_at") or ""),
+            updated_at=str(d.get("updated_at") or ""),
+            copy_count=int(d.get("copy_count") or 0),
+            last_copied=str(d.get("last_copied") or ""),
+        )
+
+    def search_blob(self):
+        parts = [self.alias, self.url, ",".join(self.tags)]
+        if self.note:
+            parts.append(self.note)
+        return " ".join(parts).lower()
+
+
+class Store:
+    """links.json: {"version": 1, "links": [...]} — alias-sorted, atomic writes."""
+
+    VERSION = 1
+
+    def __init__(self, path=None):
+        if path is None:
+            path = os.environ.get("LINKER_STORE")
+        if not path:
+            root = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+            path = str(Path(root) / "linker" / "links.json")
+        self.path = Path(path).expanduser()
+        self.map = {}
+
+    def load(self):
+        self.map = {}
+        if not self.path.exists():
+            return
+        try:
+            data = json.loads(self.path.read_text())
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+            broken = self.path.with_name(f"{self.path.name}.broken-{stamp}")
+            try:
+                self.path.rename(broken)
+                dest = f" (saved as {broken.name})"
+            except OSError:
+                dest = ""
+            warn_line(f"existing store was unreadable ({exc}){dest}")
+            return
+        records = []
+        if isinstance(data, dict):
+            records = data.get("links") or []
+        elif isinstance(data, list):
+            records = data
+        for rec in records:
+            if not isinstance(rec, dict):
+                continue
+            link = Link.from_dict(rec)
+            if link.alias:
+                self.map[link.alias] = link
+
+    def save(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.path.parent.chmod(0o700)
+        except OSError:
+            pass
+        payload = {
+            "version": self.VERSION,
+            "links": [l.to_dict() for l in sorted(self.map.values(), key=lambda l: l.alias)],
+        }
+        fd, tmp = tempfile.mkstemp(dir=str(self.path.parent), prefix=".links-")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, self.path)
+
+    def all(self):
+        return list(self.map.values())
+
+    def aliases(self):
+        return sorted(self.map.keys())
+
+    def get(self, alias):
+        return self.map.get(alias)
+
+    def contains(self, alias):
+        return alias in self.map
+
+    def find_by_url(self, url):
+        for link in self.map.values():
+            if link.url == url:
+                return link
+        return None
+
+    def add(self, link):
+        if self.contains(link.alias):
+            raise LinkerError(f'"{link.alias}" already exists')
+        self.map[link.alias] = link
+        return link
+
+    def remove(self, alias):
+        return self.map.pop(alias, None)
+
+    def rename(self, old, new):
+        link = self.map.pop(old)
+        link.alias = new
+        self.map[new] = link
+        return link
+
+    def upsert(self, link):
+        """Import semantics: replace url/tags/note now; keep local stats forever."""
+        existing = self.map.get(link.alias)
+        if existing is None:
+            stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            if not link.created_at:
+                link.created_at = stamp
+            if not link.updated_at:
+                link.updated_at = link.created_at
+            self.map[link.alias] = link
+            return "added"
+        kept = copy.deepcopy(existing)
+        kept.url = link.url
+        kept.tags = link.tags
+        if link.note:
+            kept.note = link.note
+        kept.updated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        self.map[kept.alias] = kept
+        return "updated"
+
+    def export_payload(self):
+        return {
+            "version": self.VERSION,
+            "links": [l.to_dict() for l in sorted(self.map.values(), key=lambda l: l.alias)],
+        }
+
+
+def load_store():
+    store = Store()
+    store.load()
+    return store
+
+
+def empty_state(message, hints):
+    meta(message)
+    for hint in hints:
+        meta(hint)
+
+
+# --------------------------------------------------------------------------
+# alias resolution: exact -> unique prefix -> did-you-mean
+# --------------------------------------------------------------------------
+def resolve(store, query):
+    if query is None or not str(query).strip():
+        raise AliasError("no alias given", hints=["Try: linker ls to list saved links"])
+    q = str(query).strip().lower()
+    link = store.get(q)
+    if link:
+        return link
+    prefixes = [a for a in store.aliases() if a.startswith(q)]
+    if len(prefixes) == 1:
+        return store.get(prefixes[0])
+    if len(prefixes) > 1:
+        raise AliasError(
+            f'"{q}" is ambiguous: {", ".join(prefixes)}',
+            hints=["Try: rerun with the full alias"],
+        )
+    suggestions = suggest_aliases(store, q)
+    hints = (
+        [f'did you mean: {", ".join(suggestions)}?']
+        if suggestions
+        else ["Try: linker ls to list saved links"]
+    )
+    raise AliasError(f'no link matches "{query}"', hints=hints)
+
+
+# --------------------------------------------------------------------------
+# clipboard: LINKER_CLIPBOARD -> wl-copy -> xclip -> xsel -> OSC52 (tty)
+# --------------------------------------------------------------------------
+def clipboard_candidates():
+    override = os.environ.get("LINKER_CLIPBOARD")
+    if override:
+        return [(override, "arg")]
+    if IS_MACOS:
+        return [("pbcopy", "stdin")]
+    wayland = bool(os.environ.get("WAYLAND_DISPLAY")) or \
+        os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+    order = ["wl-copy", "xclip", "xsel"] if wayland else ["xclip", "xsel", "wl-copy"]
+    return [(name, "stdin") for name in order]
+
+
+def copy_to_clipboard(text):
+    """Returns (success, tool). 'arg' tools get the text as their last argument."""
+    for name, mode in clipboard_candidates():
+        path = shutil.which(name)
+        if not path:
+            continue
+        argv = [path, text] if mode == "arg" else [path]
+        if mode == "stdin":
+            if name == "xclip":
+                argv += ["-selection", "clipboard"]
+            elif name == "xsel":
+                argv += ["--clipboard", "--input"]
+        try:
+            result = subprocess.run(
+                argv,
+                input=text if mode == "stdin" else None,
+                text=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            continue  # tool vanished mid-run or refused to exec — try the next one
+        if result.returncode == 0:
+            return True, name
+    if sys.stdout.isatty():
+        payload = base64.b64encode(text.encode()).decode()
+        sys.stdout.write(f"\x1b]52;c;{payload}\a")
+        sys.stdout.flush()
+        return True, "osc52"
+    return False, "no clipboard tool found"
+
+
+# --------------------------------------------------------------------------
+# table + card rendering (shared by ls and search)
+# --------------------------------------------------------------------------
+def sort_links(links, sort):
+    base = sorted(links, key=lambda l: l.alias)
+    if sort == "recent":
+        return sorted(base, key=lambda l: l.last_copied, reverse=True)
+    if sort == "created":
+        return sorted(base, key=lambda l: l.created_at, reverse=True)
+    return base
+
+
+def render_link_table(links, sort, plain):
+    show_last = sort == "recent"
+    if plain:
+        for link in links:
+            print("\t".join([link.alias, link.url, ",".join(link.tags), link.last_copied or ""]))
+        return
+    width = terminal_width()
+    alias_w = max(len(l.alias) for l in links)
+    tags_strs = [", ".join(l.tags) for l in links]
+    include_tags = any(t for t in tags_strs)
+    tags_w = min(max((len(t) for t in tags_strs), default=0), 24)
+    url_max = max(len(l.url) for l in links)
+    if width:
+        fixed = alias_w + (tags_w if include_tags else 0) + (10 if show_last else 0)
+        available = width - fixed - 4
+        url_w = max(12, min(available, max(url_max, 12)))
+    else:
+        url_w = max(url_max, 12)  # piped: never truncate
+    header_cells = [("ALIAS", "meta", alias_w), ("URL", "meta", url_w)]
+    if include_tags:
+        header_cells.append(("TAGS", "meta", tags_w if show_last else None))
+    if show_last:
+        header_cells.append(("LAST", "meta", None))
+    print(styled_row(header_cells).rstrip())
+    for link, tags_str in zip(links, tags_strs):
+        url_display = trunc(link.url, url_w)
+        cells = [(link.alias, "alias", alias_w), (url_display, "url", url_w)]
+        if include_tags:
+            cells.append((tags_str, "meta", tags_w if show_last else None))
+        if show_last:
+            cells.append((time_ago(link.last_copied), "meta", None))
+        print(styled_row(cells).rstrip())
+
+
+def render_card(link):
+    """The one boxed surface in the tool: `linker show <alias>`."""
+    rows = [(None, link.url, palette.url)]
+    if link.tags:
+        rows.append(("tags", ", ".join(link.tags), None))
+    if link.note:
+        note_lines = link.note.splitlines() or [link.note]
+        extra = len(note_lines[3:])
+        for i, line in enumerate(note_lines[:3]):
+            rows.append(("note" if i == 0 else None, line, None))
+        if extra:
+            rows.append((None, f"… +{extra} more line(s) — use --json", None))
+    if link.copy_count:
+        rows.append(("copied", f"{link.copy_count}× · last {time_ago(link.last_copied)}", None))
+    else:
+        rows.append(("copied", "never", None))
+    rows.append(("added", date_of(link.created_at), None))
+
+    width = terminal_width() or 100
+    label_w = max((len(l) for l, _, _ in rows if l), default=0)
+    label_indent = label_w + 2 if label_w else 0
+    content_w = max(((len(l) + 2 + len(v)) if l else len(v)) for l, v, _ in rows)
+    inner = min(content_w + 1, max(width - 4, 10))
+    total = inner + 4
+    if width < 16:
+        print(link.url)
+        return
+    fill = max(total - clear_len(link.alias) - 5, 0)
+    print("╭─ " + palette.alias(link.alias) + " " + palette.meta("─" * fill) + "╮")
+    for idx, (label, value, paint_fn) in enumerate(rows):
+        if label is not None:
+            prefix = palette.meta(label.ljust(label_indent))
+        elif idx == 0:
+            prefix = ""
+        else:
+            prefix = " " * label_indent
+        avail = inner - clear_len(prefix)
+        shown = trunc(value, avail)
+        painted = paint_fn(shown) if paint_fn else shown
+        padding = " " * max(avail - len(shown), 0)
+        print("│ " + prefix + painted + padding + " │")
+    print("╰" + palette.meta("─" * (total - 2)) + "╯")
+
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+def cmd_add(args):
+    alias = normalize_alias(args.alias)
+    url = clean_url(args.url)
+    tags = parse_tags(args.tags)
+    store = load_store()
+    existing = store.get(alias)
+    if existing:
+        raise LinkerError(
+            f'"{alias}" already exists → {existing.url}',
+            hints=[f"Try: linker edit {alias} --url https://… , or linker rm {alias}"],
+        )
+    duplicate_url = store.find_by_url(url)
+    link = Link.new(alias, url, tags, args.note or "")
+    store.add(link)
+    store.save()
+    ok(f"added {palette.alias(alias)} → {palette.url(url)}")
+    if duplicate_url:
+        warn_line(f'url also saved as "{duplicate_url.alias}" — fine if that was intended')
+    bits = []
+    if tags:
+        bits.append("tags " + ", ".join(tags))
+    if args.note:
+        bits.append(f"note {args.note}")
+    if bits:
+        meta("  " + " · ".join(bits))
+    return 0
+
+
+def cmd_ls(args):
+    store = load_store()
+    links = sort_links(store.all(), args.sort)
+    if args.tag:
+        links = [l for l in links if args.tag.lower() in l.tags]
+    if args.query:
+        q = args.query.lower()
+        links = [l for l in links if q in l.search_blob()]
+    if args.json:
+        print(json.dumps([l.to_dict() for l in links], indent=2))
+        return 0
+    if not links:
+        if not store.all():
+            empty_state("no links yet.", ["Try: linker add github https://github.com/you"])
+        else:
+            filters = []
+            if args.query:
+                filters.append(f'"{args.query}"')
+            if args.tag:
+                filters.append(f"tagged {args.tag}")
+            empty_state(
+                "no matches " + " ".join(filters) + ".",
+                [f"Try: linker ls ({pluralize(len(store.all()), 'link')} saved)"],
+            )
+        return 0
+    render_link_table(links, args.sort, args.plain)
+    if len(links) != len(store.all()):
+        meta(f"  {len(links)} of {pluralize(len(store.all()), 'link')} shown")
+    else:
+        meta("  " + pluralize(len(links), "link"))
+    return 0
+
+
+def cmd_show(args):
+    store = load_store()
+    link = resolve(store, args.alias)
+    if args.json:
+        print(json.dumps(link.to_dict(), indent=2))
+        return 0
+    if args.plain:
+        print(link.url)
+        return 0
+    render_card(link)
+    return 0
+
+
+def cmd_search(args):
+    store = load_store()
+    q = (args.query or "").strip().lower()
+    scored = []
+    for link in store.all():
+        alias_score = fuzzy_score(q, link.alias)
+        other_scores = [
+            fuzzy_score(q, blob)
+            for blob in (link.url, ",".join(link.tags), link.note)
+            if blob
+        ]
+        other = max((s for s in other_scores if s is not None), default=None)
+        if alias_score is None and other is None:
+            continue
+        scored.append(((alias_score or 0) * 3 + (other or 0), link.alias, link))
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    matches = [link for _, _, link in scored]
+    if args.json:
+        print(json.dumps([l.to_dict() for l in matches], indent=2))
+        return 0
+    if not matches:
+        empty_state("no matches.", [f"Try: linker ls ({pluralize(len(store.all()), 'link')} saved)"])
+        return 0
+    cap = 20 if not args.plain else None
+    shown = matches[:cap] if cap else matches
+    render_link_table(shown, "alias", args.plain)
+    if cap and len(matches) > cap:
+        meta(f"  {len(matches) - cap} more omitted — refine the query")
+    return 0
+
+
+def cmd_cp(args):
+    store = load_store()
+    link = resolve(store, args.alias)
+    if args.stdout or args.plain:
+        print(link.url)
+        return 0
+    link.touch_copy()
+    store.save()
+    success, detail = copy_to_clipboard(link.url)
+    if not success:
+        print(link.url)  # stdout still carries the url so scripts can recover
+        raise LinkerError(
+            "could not copy — no clipboard tool available",
+            hints=[
+                "the url is printed on stdout above",
+                "Try: sudo dnf install wl-clipboard    # wayland (or xclip on x11)",
+            ],
+            code=3,
+        )
+    if args.json:
+        print(json.dumps({"alias": link.alias, "url": link.url, "copied_via": detail}))
+        return 0
+    ok(f"{palette.alias(link.alias)} · {palette.url(link.url)}")
+    return 0
+
+
+def default_opener():
+    """`open` on macOS, xdg-open elsewhere."""
+    return "open" if IS_MACOS else "xdg-open"
+
+
+def cmd_open(args):
+    store = load_store()
+    link = resolve(store, args.alias)
+    if os.environ.get("LINKER_OPEN"):
+        opener = shlex.split(os.environ["LINKER_OPEN"])
+    else:
+        opener_cmd = shutil.which(default_opener())
+        if not opener_cmd:
+            raise LinkerError(
+                f"no opener found ({default_opener()} missing)",
+                hints=["Try: set $LINKER_OPEN to your browser, or install xdg-utils"],
+            )
+        opener = [opener_cmd]
+    try:
+        subprocess.Popen(opener + [link.url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as exc:
+        raise LinkerError(f'could not launch opener: {exc}') from exc
+    ok(f"opened {palette.alias(link.alias)}")
+    return 0
+
+
+def cmd_edit(args):
+    store = load_store()
+    link = resolve(store, args.alias)
+    flag_given = any(
+        v is not None
+        for v in (args.url, args.tags, args.add_tags, args.note, args.new_alias)
+    )
+    if not flag_given:
+        raise LinkerError(
+            "nothing to change",
+            hints=[
+                "Try: linker edit "
+                f"{link.alias} --url https://… · --tags a,b · --add-tags t · --note … · --alias newname"
+            ],
+        )
+    changes = []
+    if args.url is not None:
+        url = clean_url(args.url)
+        if url != link.url:
+            changes.append(f"url {link.url} → {url}")
+        link.url = url
+    if args.tags is not None or args.add_tags:
+        tag_list = parse_tags(args.tags) if args.tags is not None else list(link.tags)
+        for t in parse_tags(args.add_tags):
+            if t not in tag_list:
+                tag_list.append(t)
+        if tag_list != link.tags:
+            changes.append("tags " + (", ".join(tag_list) or "(none)"))
+        link.tags = tag_list
+    if args.note is not None:
+        if args.note != link.note:
+            changes.append("note " + (args.note or "(none)"))
+        link.note = args.note
+    new_alias = None
+    if args.new_alias is not None:
+        new_alias = normalize_alias(args.new_alias)
+        if new_alias != link.alias:
+            if store.contains(new_alias):
+                raise LinkerError(f'"{new_alias}" already exists')
+            changes.append(f"alias {link.alias} → {new_alias}")
+    if not changes:
+        ok(f"{palette.alias(link.alias)} unchanged")
+        return 0
+    link.updated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    if new_alias:
+        store.rename(link.alias, new_alias)
+    store.save()
+    ok(f"updated {palette.alias(new_alias or link.alias)}")
+    if args.json:
+        print(json.dumps(link.to_dict(), indent=2))
+    else:
+        meta("  " + "; ".join(changes))
+    return 0
+
+
+def cmd_rm(args):
+    store = load_store()
+    link = resolve(store, args.alias)
+    if not args.yes:
+        if not sys.stdin.isatty():
+            raise LinkerError(
+                f'refusing to delete "{link.alias}" without confirmation',
+                hints=[f"Try: linker rm {link.alias} -y"],
+            )
+        print(f"remove {link.alias} ({link.url})? [y/N] ", end="", flush=True)
+        try:
+            reply = input().strip().lower()
+        except EOFError:
+            reply = ""
+        if reply not in ("y", "yes"):
+            meta("canceled — kept")
+            return 0
+    store.remove(link.alias)
+    store.save()
+    ok(f"removed {palette.alias(link.alias)}")
+    return 0
+
+
+def cmd_tags(args):
+    store = load_store()
+    counts = {}
+    for link in store.all():
+        for tag in link.tags:
+            counts[tag] = counts.get(tag, 0) + 1
+    if args.json:
+        ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        print(json.dumps([{"tag": t, "count": n} for t, n in ordered], indent=2))
+        return 0
+    if not store.all():
+        empty_state("no links yet.", ["Try: linker add github https://github.com/you"])
+        return 0
+    if not counts:
+        empty_state(
+            "no tags yet.",
+            ["Try: linker add github https://github.com/you --tags dev"],
+        )
+        return 0
+    rows = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    if args.plain:
+        for tag, count in rows:
+            print(f"{tag}\t{count}")
+        return 0
+    tag_w = max(len(t) for t, _ in rows)
+    for tag, count in rows:
+        print(palette.alias(tag.ljust(tag_w)) + "  " + palette.meta(str(count)))
+    return 0
+
+
+def cmd_export(args):
+    store = load_store()
+    payload = store.export_payload()
+    data = json.dumps(payload, indent=2) + "\n"
+    if args.out_file:
+        path = Path(args.out_file).expanduser()
+        if not path.exists() or not path.is_file():
+            if path.resolve() == store.path.resolve():
+                raise LinkerError("refusing to export over the live store", hints=["Try: another filename"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(data)
+        ok(f'exported {len(payload["links"])} links → {str(path)}')
+    else:
+        sys.stdout.write(data)
+    return 0
+
+
+def cmd_import(args):
+    path = Path(args.file).expanduser()
+    try:
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        raise LinkerError(f'no such file: "{path}"') from None
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+        raise LinkerError(f'"{path}" is not readable json ({exc})') from exc
+    if isinstance(data, dict) and "links" in data:
+        records = data.get("links") or []
+    elif isinstance(data, dict) and data.get("alias") and data.get("url"):
+        records = [data]  # single record, e.g. from `linker show X --json`
+    elif isinstance(data, list):
+        records = data
+    else:
+        raise LinkerError(f'"{path}" contains no links array')
+    store = load_store()
+    incoming, skipped = [], []
+    for i, rec in enumerate(records):
+        if not isinstance(rec, dict) or not rec.get("alias") or not rec.get("url"):
+            skipped.append(f"record {i} is malformed")
+            continue
+        try:
+            alias = normalize_alias(str(rec["alias"]))
+            url = clean_url(str(rec["url"]))
+        except LinkerError as exc:
+            skipped.append(f"{rec.get('alias')}: {exc}")
+            continue
+        incoming.append(Link.from_dict(rec, alias=alias))
+    if args.dry_run:
+        added = sum(1 for l in incoming if not store.contains(l.alias))
+        meta(
+            f"dry run: {len(incoming)} valid · {added} new · {len(incoming) - added} updated"
+            + (f" · {len(skipped)} skipped" if skipped else "")
+        )
+        return 0
+    added = updated = 0
+    for link in incoming:
+        if store.upsert(link) == "added":
+            added += 1
+        else:
+            updated += 1
+    store.save()
+    if not incoming and skipped:
+        for skip in skipped[:5]:
+            meta(f"skipped {skip}")
+        raise LinkerError(
+            "nothing imported — every record was invalid",
+            hints=["Try: linker import <file> --dry-run first"],
+        )
+    ok(f"imported · {added} new · {updated} updated" + (f" · {len(skipped)} skipped" if skipped else ""))
+    for skip in skipped[:5]:
+        meta(f"  skipped {skip}")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# shell completion
+# --------------------------------------------------------------------------
+def completion_words():
+    words = {
+        "add", "ls", "show", "cp", "search", "edit", "rm", "open",
+        "tags", "import", "export", "completions",
+        "--help", "--version", "--no-color", "--plain", "--json", "--tags",
+        "--sort", "--tag", "--note", "--url", "--alias", "--yes", "--stdout",
+    }
+    try:
+        store = load_store()
+        words.update(store.aliases())
+    except Exception:
+        pass
+    return sorted(words)
+
+
+def cmd_completions(args):
+    if args.shell == "bash":
+        script = (
+            "# bash completion for linker — add this to ~/.bashrc:\n"
+            "#   eval \"$(linker completions bash)\"\n"
+            '_linker() {\n'
+            '  local cur="${COMP_WORDS[COMP_CWORD]}"\n'
+            '  COMPREPLY=( $(compgen -W "$(linker --completion-words 2>/dev/null)" -- "$cur") )\n'
+            "}\n"
+            "complete -F _linker linker\n"
+        )
+    else:
+        script = (
+            "# zsh completion for linker — add this to ~/.zshrc:\n"
+            "#   eval \"$(linker completions zsh)\"; compdef _linker linker\n"
+            "#compdef linker\n"
+            "_linker() {\n"
+            '  local -a lwords\n'
+            '  lwords=(${(f)"$(linker --completion-words 2>/dev/null)"})\n'
+            '  compadd -- "${lwords[@]}"\n'
+            "}\n"
+            "compdef _linker linker\n"
+        )
+    sys.stdout.write(script)
+    return 0
+
+
+# --------------------------------------------------------------------------
+# parser
+# --------------------------------------------------------------------------
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="linker",
+        description="Save and copy your links from anywhere in the terminal.",
+        epilog=(
+            "examples:\n"
+            "  linker add github https://github.com/you --tags dev,identity\n"
+            "  linker cp github            copy a link to the clipboard\n"
+            "  linker cp gi                unambiguous prefix works too\n"
+            "  linker search hub           fuzzy search alias/url/tags/note\n"
+            "  linker ls --tag dev         list links carrying a tag\n"
+            "  linker show github          full card for one link\n"
+            "storage: ~/.config/linker/links.json (override with $LINKER_STORE)"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--version", action="version", version="linker " + VERSION,
+                        help="show version and exit")
+    parser.add_argument("--completion-words", action="store_true", help=argparse.SUPPRESS)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--no-color", action="store_true", help="disable styling (automatic when piped)")
+    common.add_argument("--plain", action="store_true",
+                        help="plain output: no styling, full urls, tab-separated tables")
+    sub = parser.add_subparsers(dest="command")
+
+    p = sub.add_parser("add", parents=[common], help="save a new link",
+                       formatter_class=argparse.RawDescriptionHelpFormatter,
+                       epilog="example:\n  linker add github https://github.com/you --tags dev,identity -n main")
+    p.add_argument("alias")
+    p.add_argument("url")
+    p.add_argument("--tags", "-t", default="", help="comma-separated tags")
+    p.add_argument("--note", "-n", default="", help="free-form note")
+    p.set_defaults(handler=cmd_add)
+
+    p = sub.add_parser("ls", parents=[common], help="list saved links",
+                       formatter_class=argparse.RawDescriptionHelpFormatter,
+                       epilog="example:\n  linker ls --tag dev --sort recent")
+    p.add_argument("query", nargs="?", help="substring filter over alias/url/tags/note")
+    p.add_argument("--tag", help="only links carrying this tag")
+    p.add_argument("--sort", choices=["alpha", "recent", "created"], default="alpha")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(handler=cmd_ls)
+
+    p = sub.add_parser("show", parents=[common], help="full details for one link")
+    p.add_argument("alias")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(handler=cmd_show)
+
+    p = sub.add_parser("search", parents=[common], help="fuzzy-search links",
+                       formatter_class=argparse.RawDescriptionHelpFormatter,
+                       epilog="example:\n  linker search hub")
+    p.add_argument("query")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(handler=cmd_search)
+
+    p = sub.add_parser("cp", parents=[common], help="copy a link to the clipboard",
+                       formatter_class=argparse.RawDescriptionHelpFormatter,
+                       epilog="example:\n  linker cp github    # prefix match works: linker cp gi")
+    p.add_argument("alias")
+    p.add_argument("--stdout", action="store_true", help="print the url instead of copying")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(handler=cmd_cp)
+
+    p = sub.add_parser("edit", parents=[common], help="change a link",
+                       formatter_class=argparse.RawDescriptionHelpFormatter,
+                       epilog="example:\n  linker edit github --url https://github.com/you-v2\n"
+                              "  linker edit github --add-tags portfolio   (--tags replaces, --add-tags appends)")
+    p.add_argument("alias")
+    p.add_argument("--url")
+    p.add_argument("--tags")
+    p.add_argument("--add-tags")
+    p.add_argument("--note")
+    p.add_argument("--alias", metavar="NEW-ALIAS", dest="new_alias")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(handler=cmd_edit)
+
+    p = sub.add_parser("rm", parents=[common], help="remove a link")
+    p.add_argument("alias")
+    p.add_argument("-y", "--yes", action="store_true", help="skip confirmation")
+    p.set_defaults(handler=cmd_rm)
+
+    p = sub.add_parser("open", parents=[common], help="open a link in the browser")
+    p.add_argument("alias")
+    p.set_defaults(handler=cmd_open)
+
+    p = sub.add_parser("tags", parents=[common], help="list tags with counts")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(handler=cmd_tags)
+
+    p = sub.add_parser("export", parents=[common], help="export links as json",
+                       formatter_class=argparse.RawDescriptionHelpFormatter,
+                       epilog="example:\n  linker export backup.json\n"
+                              "  linker export | jq .    (json to stdout)")
+    p.add_argument("out_file", nargs="?", help="write to this file instead of stdout")
+    p.set_defaults(handler=cmd_export)
+
+    p = sub.add_parser("import", parents=[common], help="import links from a json file",
+                       formatter_class=argparse.RawDescriptionHelpFormatter,
+                       epilog="example:\n  linker import backup.json --dry-run")
+    p.add_argument("file")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(handler=cmd_import)
+
+    p = sub.add_parser("completions", parents=[common], help="shell completion scripts")
+    p.add_argument("shell", choices=["bash", "zsh"])
+    p.set_defaults(handler=cmd_completions)
+
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if getattr(args, "completion_words", False):
+        for word in completion_words():
+            print(word)
+        return 0
+    if getattr(args, "plain", False) or getattr(args, "no_color", False):
+        palette.off()
+    if getattr(args, "command", None) is None:
+        parser.print_help()
+        return 0
+    try:
+        return args.handler(args) or 0
+    except LinkerError as err:
+        render_error(err)
+        return err.code
+    except KeyboardInterrupt:
+        print()
+        print(palette.meta("interrupted"))
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

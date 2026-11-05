@@ -1,0 +1,17 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "cramped-padding",
+        "value": "*",
+        "files": [
+          "macos/preview/index.html"
+        ],
+        "createdAt": "2026-10-30T10:49:30.444Z",
+        "reason": "Agent: intentional native panel shell with edge-to-edge header and footer backgrounds; child containers inset the text. Browser measurements in both themes at 1440, 768, and 390 px show 20 px top clearance and 18.47 px bottom clearance. No cramped text was found."
+      }
+    ]
+  }
+}

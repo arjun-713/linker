@@ -1,0 +1,74 @@
+{
+  "version": 1,
+  "links": [
+    {
+      "alias": "apple-docs",
+      "url": "https://developer.apple.com/documentation",
+      "tags": [
+        "dev",
+        "reference"
+      ],
+      "note": "AppKit and SwiftUI documentation"
+    },
+    {
+      "alias": "figma",
+      "url": "https://www.figma.com/files",
+      "tags": [
+        "design",
+        "work"
+      ],
+      "note": "Design files and prototypes"
+    },
+    {
+      "alias": "github",
+      "url": "https://github.com/arjun",
+      "tags": [
+        "dev",
+        "identity"
+      ],
+      "note": "Main profile \u2014 sample from the CLI README"
+    },
+    {
+      "alias": "linear",
+      "url": "https://linear.app",
+      "tags": [
+        "work"
+      ],
+      "note": "Project planning"
+    },
+    {
+      "alias": "linkedin",
+      "url": "https://www.linkedin.com",
+      "tags": [
+        "identity",
+        "work"
+      ],
+      "note": "Professional network"
+    },
+    {
+      "alias": "localhost",
+      "url": "http://localhost:3000",
+      "tags": [
+        "dev"
+      ],
+      "note": "Local development server"
+    },
+    {
+      "alias": "notion",
+      "url": "https://www.notion.so",
+      "tags": [
+        "work"
+      ],
+      "note": "Notes and documents"
+    },
+    {
+      "alias": "swift",
+      "url": "https://www.swift.org/documentation/",
+      "tags": [
+        "dev",
+        "reference"
+      ],
+      "note": "Swift language reference"
+    }
+  ]
+}

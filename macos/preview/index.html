@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Linker — macOS app preview</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23111111'/%3E%3Cpath d='m13 19 6-6m-8 3-2 2a4 4 0 0 0 6 6l4-4a4 4 0 0 0 0-6m2 2 2-2a4 4 0 0 0-6-6l-4 4a4 4 0 0 0 0 6' fill='none' stroke='white' stroke-width='2'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="preview.css">
+  <script src="preview.js" type="module"></script>
+</head>
+<body>
+  <svg class="icon-library" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <symbol id="i-link" viewBox="0 0 24 24"><path d="m10 13 4-4m-6 2-3 3a4.24 4.24 0 0 0 6 6l3-3m-4-10 3-3a4.24 4.24 0 0 1 6 6l-3 3M8 9a4.25 4.25 0 0 1 6 0m-4 6a4.25 4.25 0 0 0 6 0"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></symbol>
+    <symbol id="i-reload" viewBox="0 0 24 24"><path d="M20 10a8 8 0 1 0-1.3 6M20 4v6h-6"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="m9 9 6 6m-6 0 6-6"/></symbol>
+    <symbol id="i-return" viewBox="0 0 24 24"><path d="M20 5v8a3 3 0 0 1-3 3H4m5-5-5 5 5 5"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+    <symbol id="i-check-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m7.5 12 3 3 6-6"/></symbol>
+    <symbol id="i-warning" viewBox="0 0 24 24"><path d="m10.3 4-8 14a2 2 0 0 0 1.7 3h16a2 2 0 0 0 1.7-3l-8-14a2 2 0 0 0-3.4 0ZM12 9v4m0 4h.01"/></symbol>
+    <symbol id="i-add-link" viewBox="0 0 24 24"><path d="m10 13 4-4m-6 2-3 3a4.24 4.24 0 0 0 6 6l2-2m-3-11 3-3a4.24 4.24 0 0 1 6 6l-1 1M8 9a4.25 4.25 0 0 1 6 0m-4 6a4.25 4.25 0 0 0 4 1m5-1v6m-3-3h6"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20.9 13A9 9 0 0 1 11 3.1 9 9 0 1 0 20.9 13Z"/></symbol>
+    <symbol id="i-file" viewBox="0 0 24 24"><path d="M13 3H5v18h14V9Zm0 0v6h6M8 13h8m-8 4h5"/></symbol>
+  </svg>
+
+  <header class="preview-header">
+    <div class="preview-brand">
+      <svg class="icon" aria-hidden="true"><use href="#i-link"/></svg>
+      <span>Linker <span class="preview-label">/ macOS preview</span></span>
+    </div>
+    <div class="viewer-controls">
+      <div class="theme-switch" role="group" aria-label="Preview appearance">
+        <button type="button" data-theme-choice="light" aria-pressed="false" aria-label="Light appearance" title="Light appearance"><svg class="icon" aria-hidden="true"><use href="#i-sun"/></svg></button>
+        <button type="button" data-theme-choice="dark" aria-pressed="true" aria-label="Dark appearance" title="Dark appearance"><svg class="icon" aria-hidden="true"><use href="#i-moon"/></svg></button>
+      </div>
+      <button type="button" class="load-button" id="load-file" aria-label="Load links.json" title="Load links.json"><svg class="icon" aria-hidden="true"><use href="#i-file"/></svg><span>Load links.json</span></button>
+      <input type="file" id="file-input" accept="application/json,.json" hidden>
+    </div>
+  </header>
+
+  <main>
+    <div class="preview-caption"><span class="live-dot" aria-hidden="true"></span>Interactive preview <span class="caption-separator">·</span><span id="source-label">Sample library</span></div>
+    <div class="stage" id="stage">
+      <div class="menu-bar">
+        <span class="menu-context">Menu bar</span>
+        <button type="button" id="menu-toggle" aria-label="Toggle Linker panel" aria-expanded="true" aria-controls="linker-panel" title="Toggle Linker (⌘⇧L)"><svg class="icon" aria-hidden="true"><use href="#i-link"/></svg></button>
+        <span class="menu-shortcut">⌘ ⇧ L</span>
+      </div>
+
+      <section class="linker-panel" id="linker-panel" role="dialog" aria-label="Linker app">
+        <header class="panel-header">
+          <div class="panel-brand"><svg class="icon" aria-hidden="true"><use href="#i-link"/></svg><h1>Linker</h1></div>
+          <div class="panel-utilities"><kbd>⌘ ⇧ L</kbd><button type="button" id="reload" class="icon-button" aria-label="Reload links" aria-keyshortcuts="Meta+R" title="Reload links (⌘R)"><svg class="icon" aria-hidden="true"><use href="#i-reload"/></svg></button></div>
+        </header>
+        <div class="search-wrap">
+          <div class="search-field">
+            <svg class="icon" aria-hidden="true"><use href="#i-search"/></svg>
+            <input id="search" type="text" autocomplete="off" spellcheck="false" placeholder="Search your links…" aria-label="Search links by alias, URL, tag or note" role="combobox" aria-autocomplete="list" aria-expanded="true" aria-controls="link-results">
+            <button type="button" id="clear-search" class="icon-button" aria-label="Clear search" hidden><svg class="icon" aria-hidden="true"><use href="#i-close"/></svg></button>
+          </div>
+        </div>
+        <div id="tag-filters" class="tag-filters" role="group" aria-label="Filter links by tag"></div>
+        <div class="list-heading"><span id="list-title">Your links</span><span id="result-count">0 links</span></div>
+        <div class="results" id="results-region">
+          <div class="link-list" id="link-results" role="listbox" aria-label="Saved links"></div>
+          <div class="message" id="message" hidden></div>
+        </div>
+        <footer class="panel-footer">
+          <div class="footer-actions" id="footer-actions">
+            <span class="navigate-hint"><kbd>↑</kbd><kbd>↓</kbd><span>Navigate</span></span>
+            <div class="primary-actions">
+              <button type="button" id="open-selected" aria-label="Open selected link in browser" aria-keyshortcuts="Meta+Enter">Open <kbd>⌘ ↵</kbd></button>
+              <button type="button" id="copy-selected" aria-label="Copy selected URL" aria-keyshortcuts="Enter">Copy <kbd>↵</kbd></button>
+            </div>
+          </div>
+          <div class="feedback" id="feedback" role="status" aria-live="polite" hidden></div>
+        </footer>
+      </section>
+
+      <div class="closed-panel" id="closed-panel" hidden>
+        <svg class="icon" aria-hidden="true"><use href="#i-link"/></svg>
+        <p id="closed-message">Your links are a keystroke away.</p>
+        <button type="button" id="reopen">Open Linker <kbd>⌘ ⇧ L</kbd></button>
+      </div>
+    </div>
+    <div class="preview-options">
+      <label for="preview-state">Preview state</label>
+      <select id="preview-state">
+        <option value="library">Saved links</option>
+        <option value="no-matches">No search results</option>
+        <option value="empty">Empty library</option>
+        <option value="error">File error</option>
+      </select>
+      <button type="button" id="reset-preview">Reset preview</button>
+    </div>
+    <p class="preview-note">A browser recreation of the SwiftUI panel, at 440 × 568 pt.<br>Search, use ↑ ↓, then ↵ to copy. ⌘ ↵ opens the link.</p>
+    <p id="import-status" class="import-status" role="status" aria-live="polite"></p>
+  </main>
+  <footer class="preview-footer"><span>Local preview · No account needed</span><span>The native app follows your Mac’s appearance.</span></footer>
+</body>
+</html>
