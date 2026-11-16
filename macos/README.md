@@ -3,11 +3,17 @@
 A small menu bar app for the links you reach for every day. Click the link icon or
 press **⌘⇧L**, find an alias, and press Return to copy its URL. The panel has a
 readable two-line list, tag filters, and light and dark appearances that follow
-your Mac’s settings.
+your Mac’s settings. On macOS 26 and newer the panel is drawn in Apple’s
+**Liquid Glass** style; on macOS 13–25 it falls back to a solid panel with the
+same layout.
+
+You can **add links right in the panel** — click the **+** button or press
+**⌘N**, fill in an alias, URL, tags and an optional note, and it is saved to the
+same store the CLI uses (same schema, same validation, atomic 0600 writes).
+Edits and removals stay in the terminal.
 
 It reads the **same store as the CLI**: `~/.config/linker/links.json`, or the path
-in `LINKER_STORE` when that environment variable is passed to the app. Editing
-stays in the terminal. The app does not change links or copy statistics.
+in `LINKER_STORE` when that environment variable is passed to the app.
 
 ## See it without a Mac
 
@@ -22,7 +28,9 @@ preview needs Python 3 and a modern browser, with no dependencies to install.
 Stop the server with Ctrl+C.
 
 The browser preview mirrors the native panel’s 440 × 568 pt layout, palette,
-labels and fuzzy ranking. On narrow browser windows it fits the available width.
+labels and fuzzy ranking. It predates the native app’s Liquid Glass styling and
+add-link form, so it shows the solid list-panel look only. On narrow browser
+windows it fits the available width.
 Use the sun/moon controls to compare appearances and the state selector to see an
 empty library, an unsuccessful search or a file error. Search, tag filtering,
 arrow navigation, clipboard copying and opening URLs all work. On Linux/Windows,
@@ -57,29 +65,49 @@ Requirements: macOS 13 (Ventura) or newer and Xcode Command Line Tools
 ```
 
 The build compiles `LinkerApp.swift` (store, actions, AppKit lifecycle and hotkey)
-and `LinkerViews.swift` (SwiftUI presentation) and targets macOS 13 explicitly.
+and `LinkerViews.swift` (SwiftUI presentation, including the Liquid Glass
+styling and the add-link form) and targets macOS 13 explicitly. Liquid Glass
+APIs are gated behind `#available(macOS 26.0, *)`, so the same binary runs on
+older systems with the solid fallback.
 
-After launching, right-click the menu bar icon for **Launch at Login**, **Open
-links.json**, and **Quit Linker**. Launch at Login requires the app to live in
-`/Applications`.
+After launching, right-click the menu bar icon for **Add Link…**, **Launch at
+Login**, **Open links.json**, and **Quit Linker**. Launch at Login requires the
+app to live in `/Applications`.
 
 ## Controls
 
 | Input | Action |
 | --- | --- |
 | Menu bar icon or **⌘⇧L** | Show/hide the panel |
+| **+** button or **⌘N** | Open the add-link form |
 | Type | Fuzzy search alias, URL, tags and notes |
 | Tag button | Combine a tag filter with the current search |
+| **A–Z / Recent** button or **⌘S** | Toggle between alphabetical and recently-copied order |
 | ↑ / ↓ or hover | Select a link; keyboard selection scrolls into view |
 | Return, click a row, or Copy | Copy the selected URL, confirm, then hide |
 | **⌘Return** or Open | Open the selected link in your browser |
+| **⌘E** | Edit the selected link in the panel |
+| **⌘⌫** | Delete the selected link (**⌘Z** or **Undo** puts it back) |
+| Right-click a row | Copy, open, edit or delete that link |
 | **⌘R** or reload icon | Reread the store |
 | **⌘F** | Focus search |
-| Escape / click outside | Hide the panel |
+| Escape / click outside | Close the add form, then hide the panel |
 
-An unreadable store shows a retry action. A missing store shows the command to
-save your first link. A search with no results offers **Clear filters**. Copy
-failures keep the panel open so you can retry.
+Right-clicking the menu bar icon also lists your first links as one-click
+**Copy …** items, without opening the panel.
+
+In the add form: Return advances from alias → URL, and Return in any field after
+the URL saves. The alias checks format and duplicates while you type; a URL on
+the pasteboard when the form opens pre-fills the URL field. A bare domain such
+as `example.com/foo` gets `https://` added automatically; `git@host:user/repo.git`
+becomes an HTTPS URL, like the CLI.
+
+Copying from the panel updates the link's `copy_count` and `last_copied` in the
+store, which feeds the **Recent** sort and the `N×` marker shown on each row.
+
+An unreadable store shows a retry action. A missing store offers **Add your
+first link**. A search with no results offers **Clear filters**. Copy failures
+keep the panel open so you can retry.
 
 ## Validation
 
@@ -90,9 +118,9 @@ node --test tests/test_preview.mjs     # preview ranking / schema checks (option
 
 The preview was checked in local Chrome at 1440, 768 and 390 px in both
 appearances, including local JSON import, clipboard success/denial, keyboard
-scrolling, opening links, and empty/error recovery. Swift sources were parsed
-for syntax on Linux. **The native build has not been compiled or executed on a
-Mac.**
+scrolling, opening links, and empty/error recovery. The native build compiles
+and runs on macOS; the add-link form was exercised end-to-end against a
+`LINKER_STORE` file and read back by the CLI.
 
 Presentation uses the system font, simple outline symbols and neutral surfaces.
 Implementation references: Apple’s [ScrollViewReader documentation](https://developer.apple.com/documentation/swiftui/scrollviewreader)

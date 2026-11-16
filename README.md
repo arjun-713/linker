@@ -70,8 +70,11 @@ so scripts can recover.
 
 The CLI is macOS-ready: `pbcopy` for the clipboard and `open` for `linker open`,
 auto-detected (`python3` needs the Xcode Command Line Tools). There is also a native
-menu bar app with a compact, keyboard-first panel, light and dark appearances, tag
-filters, a global **⌘⇧L** hotkey, and the same `~/.config/linker/links.json` store:
+menu bar app with a compact, keyboard-first panel, tag filters, a global **⌘⇧L**
+hotkey, Apple's Liquid Glass styling on macOS 26+, and an in-panel add-link form
+(**⌘N**) that writes the same `~/.config/linker/links.json` store as the CLI —
+edit (**⌘E**), delete with undo (**⌘⌫** / **⌘Z**) and copy statistics with a
+recently-copied sort (**⌘S**) work there too:
 
 ```console
 $ ./macos/build.sh --install    # needs macOS 13+ and Xcode CLT; see macos/README.md
